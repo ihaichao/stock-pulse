@@ -3,118 +3,240 @@
 ## 1. 整体架构
 
 ```
-┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│   Frontend   │────▶│   Backend API    │────▶│   Data Sources   │
-│  (Next.js)   │◀────│   (Python/Fast   │◀────│   (yfinance,     │
-│              │     │    API)          │     │    macro APIs)   │
-└─────────────┘     └──────┬───────────┘     └─────────────────┘
-                           │
+┌─────────────┐     ┌──────────────────┐     ┌───────────────────┐
+│   Frontend   │────▶│   Backend API    │────▶│   Data Sources     │
+│  (Next.js    │◀────│   (Python/Fast   │◀────│   (SEC EDGAR,      │
+│   SSR/SSG)   │     │    API)          │     │    Earnings Cal,   │
+└─────────────┘     └──────┬───────────┘     │    Finnhub, etc)   │
+                           │                 └───────────────────┘
                     ┌──────▼───────┐
-                    │   Database    │
-                    │  (PostgreSQL  │
-                    │   or SQLite)  │
+                    │  PostgreSQL   │
+                    │  + Redis      │
                     └──────┬───────┘
                            │
-                    ┌──────▼───────┐
-                    │   LLM Layer   │
-                    │  (AI 解读生成) │
-                    └──────────────┘
+              ┌────────────┼────────────┐
+              │                         │
+       ┌──────▼───────┐         ┌──────▼───────┐
+       │   LLM Layer   │         │     FCM       │
+       │  (AI 解读生成) │         │  (Web Push)   │
+       └──────────────┘         └──────────────┘
 ```
 
 ### 技术栈选型
 
 | 层级 | 技术 | 理由 |
 |------|------|------|
-| 前端 | **Next.js (React)** | SSR/SSG 支持好（SEO 友好）、生态成熟、部署方便 |
-| 后端 API | **Python + FastAPI** | 与 yfinance/数据处理生态兼容、Jason 熟悉 Python |
-| 数据库 | **SQLite（MVP）→ PostgreSQL（生产）** | MVP 阶段零运维，后续切换成本低 |
+| 前端 | **Next.js 14+ (App Router)** | SSR/SSG 对 SEO 友好、React 生态成熟、API Routes 可选 |
+| 后端 API | **Python + FastAPI** | 数据处理生态好、与 SEC EDGAR / yfinance 等兼容 |
+| 数据库 | **PostgreSQL** | 生产级可靠性、JSON 字段支持、全文搜索能力 |
+| 缓存 | **Redis** | 热数据缓存（事件列表、每日摘要）、定时任务锁、rate limit |
+| Web Push | **Firebase Cloud Messaging (FCM)** | 免费、稳定、跨平台（浏览器 + 移动端） |
 | LLM | **通过 HTTP 调用（OpenClaw 环境）** | 复用现有模型配置，不硬编码 API key |
-| 部署 | **VPS 直接部署（MVP）** | 先跑通，后续可以迁移到 Vercel + Railway 等 |
+| 定时任务 | **APScheduler / Celery Beat** | 定时抓取数据源、生成 AI 摘要、清理过期数据 |
+| 部署 | **VPS + Docker Compose** | PostgreSQL + Redis + 后端 + 前端统一编排 |
 
 ---
 
-## 2. 后端设计
+## 2. 数据源
 
-### 2.1 目录结构
+### 2.1 SEC EDGAR
+
+美国证券交易委员会的公开数据系统，包含：
+
+- **Form 4（内部人交易）**：高管 / 董事的买卖记录
+- **Form 8-K（重大事件）**：公司重大变更、并购、管理层变动等
+- **10-Q / 10-K（财报原文）**：季报 / 年报全文
+
+**获取方式：**
+
+- EDGAR FULL-TEXT SEARCH API：`https://efts.sec.gov/LATEST/search-index?q=...`
+- EDGAR Company Filings API：`https://data.sec.gov/submissions/CIK{cik}.json`
+- RSS Feeds：按公司 CIK 订阅最新 filing
+- 注意：SEC 要求 User-Agent 包含联系邮箱，rate limit 约 10 req/s
+
+**数据处理流程：**
+
+```
+SEC EDGAR API → 解析 filing 类型/日期/内容 → 标准化为 StockEvent → 存入 PostgreSQL
+```
+
+### 2.2 Earnings Calendar
+
+**数据来源（按优先级）：**
+
+1. **yfinance**：免费，可获取下次财报日期、历史 EPS
+2. **Finnhub Earnings Calendar API**：免费 tier 可用，数据结构更规范
+3. **Alpha Vantage**：备选
+
+**获取内容：**
+
+- 未来财报日期（盘前/盘后）
+- 预期 EPS / 营收（consensus）
+- 实际 EPS / 营收（财报公布后）
+- 历史财报表现（过去 4–8 个季度的 beat/miss 记录）
+
+### 2.3 宏观经济日历
+
+**数据来源：**
+
+- **Finnhub Economic Calendar**（免费 tier）
+- **手动维护的固定日程表**（FOMC 日程、CPI/NFP 发布日已知）
+
+**覆盖的宏观事件：**
+
+| 事件 | 频率 | 重要性 |
+|------|------|--------|
+| FOMC 利率决议 | 8 次/年 | 🔴 高 |
+| CPI（消费者价格指数）| 月度 | 🔴 高 |
+| 非农就业 (NFP) | 月度 | 🔴 高 |
+| GDP | 季度 | 🔴 高 |
+| PPI（生产者价格指数）| 月度 | 🟡 中 |
+| 初请失业金 | 周度 | 🟡 中 |
+| PMI | 月度 | 🟡 中 |
+| 消费者信心指数 | 月度 | 🟢 低 |
+
+---
+
+## 3. 后端设计
+
+### 3.1 目录结构
 
 ```
 stock-pulse/
 ├── README.md
 ├── docs/
-│   └── TECHNICAL.md          # 本文件
+│   └── TECHNICAL.md
 ├── backend/
 │   ├── __init__.py
-│   ├── main.py               # FastAPI 入口
-│   ├── config.py              # 配置管理（环境变量）
+│   ├── main.py                 # FastAPI 入口
+│   ├── config.py               # 配置管理（环境变量 / pydantic-settings）
 │   ├── models/
 │   │   ├── __init__.py
-│   │   ├── portfolio.py       # 持仓数据模型
-│   │   ├── event.py           # 事件数据模型
-│   │   └── macro.py           # 宏观事件数据模型
+│   │   ├── portfolio.py        # 持仓数据模型
+│   │   ├── event.py            # 事件数据模型
+│   │   └── user.py             # 用户模型（MVP 简化版）
 │   ├── services/
 │   │   ├── __init__.py
-│   │   ├── earnings.py        # 财报数据获取与处理
-│   │   ├── macro_calendar.py  # 宏观经济日历数据
-│   │   ├── event_aggregator.py # 事件聚合逻辑
-│   │   └── ai_explain.py     # AI 解读生成
+│   │   ├── edgar.py            # SEC EDGAR 数据抓取与解析
+│   │   ├── earnings.py         # 财报数据获取与处理
+│   │   ├── macro_calendar.py   # 宏观经济日历
+│   │   ├── event_aggregator.py # 事件聚合（合并多数据源 → 统一事件流）
+│   │   └── ai_explain.py       # AI 解读生成
 │   ├── api/
 │   │   ├── __init__.py
-│   │   ├── portfolio.py       # 持仓管理 API
-│   │   ├── events.py          # 事件查询 API
-│   │   ├── daily_summary.py   # 每日摘要 API
-│   │   └── macro.py           # 宏观日历 API
-│   └── db/
+│   │   ├── portfolio.py        # 持仓管理 API
+│   │   ├── events.py           # 事件查询 API
+│   │   ├── daily_summary.py    # 每日摘要 API
+│   │   ├── macro.py            # 宏观日历 API
+│   │   └── push.py             # FCM 推送注册/管理 API
+│   ├── tasks/
+│   │   ├── __init__.py
+│   │   ├── scheduler.py        # 定时任务调度器
+│   │   ├── fetch_earnings.py   # 定时抓取财报数据
+│   │   ├── fetch_edgar.py      # 定时抓取 SEC EDGAR
+│   │   ├── fetch_macro.py      # 定时抓取宏观日历
+│   │   └── generate_summaries.py # 定时生成 AI 摘要
+│   ├── db/
+│   │   ├── __init__.py
+│   │   ├── database.py         # PostgreSQL 连接（SQLAlchemy async）
+│   │   ├── redis.py            # Redis 连接
+│   │   └── migrations/         # Alembic 数据库迁移
+│   └── push/
 │       ├── __init__.py
-│       ├── database.py        # 数据库连接管理
-│       └── schemas.py         # 表结构定义
-├── frontend/                  # Next.js 项目（后续创建）
+│       └── fcm.py              # Firebase Cloud Messaging 推送
+├── frontend/                   # Next.js 项目
+├── docker-compose.yml
 ├── requirements.txt
 └── .env.example
 ```
 
-### 2.2 数据模型
+### 3.2 数据模型（PostgreSQL）
 
-#### Portfolio（持仓）
+#### users
 
-```python
-class PortfolioItem:
-    user_id: str          # 用户标识（MVP 用简单 token）
-    ticker: str           # 股票代码
-    added_at: datetime    # 添加时间
-    notes: str | None     # 用户备注（可选）
+```sql
+CREATE TABLE users (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    token         VARCHAR(64) UNIQUE NOT NULL,   -- MVP: 前端生成的随机 token
+    fcm_token     TEXT,                          -- FCM 推送 token
+    created_at    TIMESTAMPTZ DEFAULT now(),
+    updated_at    TIMESTAMPTZ DEFAULT now()
+);
 ```
 
-#### Event（事件）
+#### portfolios
 
-```python
-class StockEvent:
-    id: str               # 唯一标识
-    ticker: str           # 关联股票（宏观事件为 None）
-    event_type: str       # "earnings" | "macro" | "insider" | "analyst"
-    event_date: datetime  # 事件发生时间
-    title: str            # 简短标题
-    description: str      # 简短描述
-    importance: str       # "high" | "medium" | "low"
-    status: str           # "upcoming" | "completed"
-    
-    # 财报特有字段
-    eps_estimate: float | None
-    eps_actual: float | None
-    revenue_estimate: float | None
-    revenue_actual: float | None
-    
-    # 宏观特有字段
-    macro_event_name: str | None    # "FOMC" | "CPI" | "NFP" | ...
-    consensus: str | None
-    actual: str | None
-    previous: str | None
-    
-    # AI 解读
-    ai_summary: str | None          # AI 生成的 1–3 句解读
-    ai_detail: str | None           # AI 生成的详细解读（事件详情页用）
+```sql
+CREATE TABLE portfolios (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID REFERENCES users(id) ON DELETE CASCADE,
+    ticker     VARCHAR(16) NOT NULL,
+    notes      TEXT,
+    added_at   TIMESTAMPTZ DEFAULT now(),
+    UNIQUE(user_id, ticker)
+);
+CREATE INDEX idx_portfolios_user ON portfolios(user_id);
+CREATE INDEX idx_portfolios_ticker ON portfolios(ticker);
 ```
 
-### 2.3 API 设计
+#### events
+
+```sql
+CREATE TABLE events (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    ticker          VARCHAR(16),                -- NULL for macro events
+    event_type      VARCHAR(32) NOT NULL,       -- 'earnings', 'macro', 'insider', 'analyst', 'filing'
+    event_date      TIMESTAMPTZ NOT NULL,
+    title           VARCHAR(512) NOT NULL,
+    description     TEXT,
+    importance      VARCHAR(16) DEFAULT 'medium', -- 'high', 'medium', 'low'
+    status          VARCHAR(16) DEFAULT 'upcoming', -- 'upcoming', 'completed'
+
+    -- Earnings fields
+    eps_estimate    DECIMAL(10,4),
+    eps_actual      DECIMAL(10,4),
+    revenue_estimate BIGINT,
+    revenue_actual   BIGINT,
+    report_time     VARCHAR(16),               -- 'BMO' (before market open) / 'AMC' (after market close)
+
+    -- Macro fields
+    macro_event_name VARCHAR(64),
+    consensus       VARCHAR(64),
+    actual_value    VARCHAR(64),
+    previous_value  VARCHAR(64),
+
+    -- SEC EDGAR fields
+    filing_type     VARCHAR(16),               -- '4', '8-K', '10-Q', '10-K'
+    filing_url      TEXT,
+
+    -- AI
+    ai_summary      TEXT,                      -- 1-3 句简短解读
+    ai_detail       TEXT,                      -- 详细解读（事件详情页）
+
+    -- Meta
+    source          VARCHAR(64),               -- 'yfinance', 'finnhub', 'edgar', 'manual'
+    raw_data        JSONB,                     -- 原始数据存档
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    updated_at      TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX idx_events_ticker ON events(ticker);
+CREATE INDEX idx_events_date ON events(event_date);
+CREATE INDEX idx_events_type ON events(event_type);
+CREATE INDEX idx_events_status ON events(status);
+```
+
+### 3.3 Redis 缓存策略
+
+| Key 模式 | 内容 | TTL |
+|----------|------|-----|
+| `events:upcoming:{user_id}` | 用户持仓相关的未来 7 天事件 JSON | 30 min |
+| `events:today` | 今日全部事件 | 15 min |
+| `daily_summary:{user_id}` | 每日摘要（含 AI 解读）| 1 hour |
+| `macro:calendar:{month}` | 月度宏观日历 | 6 hours |
+| `stock:events:{ticker}` | 个股事件时间线 | 1 hour |
+| `task:lock:{task_name}` | 定时任务分布式锁 | 任务超时时间 |
+
+### 3.4 API 设计
 
 #### 持仓管理
 
@@ -130,268 +252,233 @@ DELETE /api/portfolio/:ticker      # 删除持仓
 GET    /api/events/upcoming        # 未来 7 天与持仓相关的事件
 GET    /api/events/today           # 今日事件（预览）
 GET    /api/events/yesterday       # 昨日事件（复盘）
-GET    /api/events/stock/:ticker   # 某只股票的所有事件（个股事件页）
+GET    /api/events/stock/:ticker   # 某只股票的所有事件
 GET    /api/events/:id             # 单个事件详情（含 AI 解读）
 ```
 
 #### 宏观日历
 
 ```
-GET    /api/macro/calendar         # 当月宏观事件日历
-       ?month=2026-03              # 可选：指定月份
+GET    /api/macro/calendar?month=2026-03
 ```
 
 #### 每日摘要
 
 ```
-GET    /api/daily-summary          # 今日摘要（聚合持仓相关事件 + AI 解读）
+GET    /api/daily-summary          # 今日摘要
 ```
 
-### 2.4 用户身份（MVP 简化方案）
-
-MVP 阶段不做完整的注册/登录系统：
-
-- 用户首次访问时，前端生成一个随机 `user_token`，存在 localStorage
-- 后续所有 API 请求通过 `Authorization: Bearer <user_token>` 传递
-- 后端用这个 token 关联用户的持仓数据
-- 优点：零注册摩擦，用户打开就能用
-- 缺点：换设备/清缓存会丢失数据（MVP 可接受）
-
-Phase 2 再加：邮箱注册 / OAuth 登录 / 数据迁移。
-
----
-
-## 3. 数据源方案
-
-### 3.1 财报数据（Earnings）
-
-**MVP 数据源选择：**
-
-| 数据源 | 优点 | 缺点 | 推荐 |
-|--------|------|------|------|
-| yfinance | 免费、Python 生态好 | 不稳定、有 rate limit | MVP 首选 |
-| Alpha Vantage | 有免费 tier | 免费额度有限（25 次/天） | 备选 |
-| Finnhub | 有免费 tier | 部分数据需付费 | 备选 |
-| Earnings Whispers | 数据质量好 | 需付费 | Phase 2 |
-
-**MVP 方案：先用 yfinance**
-
-- `yfinance` 可以获取：
-  - 下一次财报日期（`earningsDate`）
-  - 历史财报 EPS（`earningsHistory`）
-  - 预期 EPS（`earningsEstimate`）
-
-- 数据刷新策略：
-  - 每天定时（如 UTC 06:00 / 12:00）刷新一次所有用户持仓涉及的 ticker
-  - 结果缓存到数据库，API 直接从数据库读
-
-### 3.2 宏观经济日历
-
-**MVP 数据源选择：**
-
-| 数据源 | 优点 | 缺点 | 推荐 |
-|--------|------|------|------|
-| Finnhub Economic Calendar | 免费 tier 可用 | 数据覆盖面一般 | MVP 首选 |
-| Trading Economics API | 数据质量高 | 需付费 | Phase 2 |
-| Investing.com 爬取 | 数据全 | 不稳定、法律风险 | 不推荐 |
-| 手动维护 | 可控 | 费人力 | 保底方案 |
-
-**MVP 方案：Finnhub 免费 tier + 手动补充**
-
-- 主要宏观事件是固定的（FOMC 日程、CPI 发布日等），可以预先录入
-- 用 Finnhub 的 economic calendar API 自动拉取，手动补充遗漏
-- 对于最重要的几个（FOMC、CPI、NFP），维护一份「固定日程表」作为兜底
-
-### 3.3 数据刷新架构
+#### Push 推送
 
 ```
-┌─────────────────┐
-│  Scheduled Job   │  ← 每天 UTC 06:00 / 12:00 / 20:00
-│  (cron / APScheduler)
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────┐
-│  Fetch earnings  │────▶│              │
-│  for all tickers │     │   Database   │
-│  in portfolios   │────▶│   (events    │
-│                  │     │    table)    │
-│  Fetch macro     │────▶│              │
-│  calendar        │     └──────────────┘
-└─────────────────┘
+POST   /api/push/register          # 注册 FCM token { "fcm_token": "..." }
+DELETE /api/push/unregister        # 取消推送
 ```
 
-- 不实时调用外部 API（避免 rate limit + 响应慢）
-- 用户请求 → 直接从数据库读 → 秒级响应
+### 3.5 用户身份（MVP 简化方案）
+
+与之前方案一致：
+
+- 前端首次访问生成随机 `user_token`，存 localStorage
+- 后端自动创建对应 user 记录
+- 所有 API 通过 `Authorization: Bearer <user_token>` 识别用户
+- Phase 2 再加邮箱注册 / OAuth
 
 ---
 
 ## 4. AI 解读方案
 
-### 4.1 解读层级
+与之前方案一致，三个层级：
 
 | 层级 | 用途 | 长度 | 生成时机 |
 |------|------|------|----------|
-| **一句话摘要** | 事件列表里显示 | 1 句话 | 数据刷新时批量生成 |
-| **简短解读** | 每日摘要页 | 1–3 句话 | 数据刷新时批量生成 |
-| **详细解读** | 事件详情页 | 3–5 段 | 用户点击时按需生成（缓存） |
+| 一句话摘要 | 事件列表 | 1 句 | 数据刷新时批量生成 |
+| 简短解读 | 每日摘要 | 1–3 句 | 数据刷新时批量生成 |
+| 详细解读 | 事件详情页 | 3–5 段 | 用户点击时按需生成（缓存到 DB） |
 
-### 4.2 Prompt 设计思路
+LLM 调用方式：
 
-**财报事件（upcoming）：**
-
-```
-这只股票（{ticker}）将在 {date} 发布财报。
-市场预期 EPS 为 {eps_estimate}，营收预期为 {revenue_estimate}。
-过去 4 个季度的财报表现：{history_summary}。
-
-请用 1–3 句简明中文告诉普通投资者：
-1. 这次财报值得关注的点是什么
-2. 如果大幅超预期或不及预期，可能意味着什么
-不要给出买卖建议。
-```
-
-**财报事件（completed）：**
-
-```
-{ticker} 刚发布了 {quarter} 季度财报。
-实际 EPS: {eps_actual}（预期 {eps_estimate}），{beat_or_miss}。
-实际营收: {revenue_actual}（预期 {revenue_estimate}）。
-盘后股价变动: {after_hours_change}%。
-
-请用 1–3 句简明中文告诉普通投资者：
-1. 这份财报的关键信息
-2. 市场为什么这样反应
-不要给出买卖建议。
-```
-
-**宏观事件：**
-
-```
-今天将公布 {event_name}（{date}）。
-前值: {previous}，市场预期: {consensus}。
-
-请用 1–2 句简明中文告诉普通投资者：
-1. 这个数据为什么重要
-2. 如果大幅高于或低于预期，通常对美股有什么影响
-不要给出买卖建议。
-```
-
-### 4.3 调用方式
-
-与 vibe-investing 项目一致：
-
-- 通过环境变量 `STOCK_PULSE_LLM_ENDPOINT` 指向本地 LLM HTTP 服务
+- 环境变量 `STOCK_PULSE_LLM_ENDPOINT` 指向本地 HTTP 服务
 - 请求：`POST { "prompt": "..." }`
 - 响应：`{ "text": "..." }`
-- 复用 OpenClaw 环境的模型配置
+- 复用 OpenClaw 环境的模型
 
 ---
 
-## 5. 前端设计
+## 5. Web Push 方案（FCM）
 
-### 5.1 技术选型
+### 5.1 架构
+
+```
+[用户浏览器] ── 注册 Service Worker ── 获取 FCM Token ──▶ [后端存储 token]
+                                                              │
+[定时任务：每日摘要生成完毕] ──▶ [后端调用 FCM API] ──▶ [推送到浏览器]
+```
+
+### 5.2 推送场景
+
+| 场景 | 时机 | 内容 |
+|------|------|------|
+| 每日盘前摘要 | 美东 8:30 AM（UTC 13:30） | 「今天你的持仓有 X 个事件需要关注」 |
+| 高重要性事件提醒 | 事件前 1 小时 | 「AAPL 今晚盘后发布财报」 |
+| 盘后复盘 | 美东 8:00 PM（UTC 01:00） | 「昨夜 X 个持仓事件已出结果」 |
+
+### 5.3 实现要点
+
+- 前端：注册 Service Worker + 请求通知权限 + 获取 FCM token
+- 后端：用 `firebase-admin` SDK 发送推送
+- Firebase 项目需要：创建 Firebase 项目 → 下载 service account key → 配置到后端环境
+
+---
+
+## 6. 前端设计
+
+### 6.1 技术选型
 
 - **Next.js 14+**（App Router）
-- **Tailwind CSS**（快速样式开发）
-- **shadcn/ui**（组件库，风格干净）
+- **Tailwind CSS** + **shadcn/ui**
+- **React Query (TanStack Query)**：API 数据获取 + 缓存
+- **next-pwa**：Service Worker + FCM 集成
 
-### 5.2 页面路由
+### 6.2 页面路由
 
 ```
-/                          # 首页（未登录：介绍页 / 已登录：仪表盘）
+/                          # 首页（未登录：介绍 / 已登录：仪表盘）
 /today                     # 今日事件页（预览 + 复盘 tab）
-/stock/[ticker]            # 个股事件页
-/macro                     # 宏观日历页
+/stock/[ticker]            # 个股事件页（SSG，SEO 友好）
+/macro                     # 宏观日历页（SSG）
 /event/[id]                # 事件详情页
-/settings                  # 持仓管理 / 设置
+/settings                  # 持仓管理
 ```
 
-### 5.3 关键交互
+### 6.3 SEO 策略
 
-- **持仓输入**：一个简单的搜索框 + 添加按钮，支持模糊搜索 ticker / 公司名
-- **事件时间线**：水平滚动的 7 天时间线，今天居中高亮
-- **事件卡片**：点击展开 AI 解读，或跳转到详情页
-- **日历视图**：宏观日历用月度网格，每格标注当天的宏观事件
-
-### 5.4 响应式设计
-
-- 手机端优先（很多人在手机上查事件日历）
-- 桌面端自适应扩展
+- `/stock/[ticker]` 和 `/macro` 使用 **SSG (Static Site Generation)** + **ISR (Incremental Static Regeneration)**
+- 自动生成 sitemap.xml
+- 结构化数据（JSON-LD）标注财报日期等信息
+- 页面 title/description 模板化：
+  - `NVDA Earnings Date & Events | Stock Pulse`
+  - `US Macro Economic Calendar - FOMC, CPI, NFP | Stock Pulse`
 
 ---
 
-## 6. 部署方案（MVP）
+## 7. 部署方案
 
-### 6.1 最简部署
+### Docker Compose
 
-在当前 VPS 上直接跑：
+```yaml
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: stock_pulse
+      POSTGRES_USER: sp
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  backend:
+    build: ./backend
+    depends_on: [postgres, redis]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sp:${DB_PASSWORD}@postgres:5432/stock_pulse
+      REDIS_URL: redis://redis:6379/0
+      STOCK_PULSE_LLM_ENDPOINT: ${LLM_ENDPOINT}
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY}
+    ports:
+      - "9002:9002"
+
+  frontend:
+    build: ./frontend
+    depends_on: [backend]
+    environment:
+      NEXT_PUBLIC_API_URL: http://backend:9002
+    ports:
+      - "3000:3000"
+
+volumes:
+  pgdata:
 ```
-stock-pulse/
-├── backend/   → uvicorn，监听 :9002
-├── frontend/  → next start，监听 :3000
-└── nginx      → 反向代理，统一入口
-```
 
-### 6.2 环境变量
+Nginx 做反向代理：
+
+- `stockpulse.com` → frontend:3000
+- `stockpulse.com/api/*` → backend:9002
+
+---
+
+## 8. MVP 开发计划（按周）
+
+### Week 1：后端骨架 + 数据层
+
+- [ ] 项目初始化（FastAPI + SQLAlchemy + Alembic）
+- [ ] Docker Compose（PostgreSQL + Redis）
+- [ ] 数据库 schema + 初始迁移
+- [ ] 持仓管理 API（CRUD）
+- [ ] 基础配置管理（pydantic-settings）
+
+### Week 2：数据采集 + 事件聚合
+
+- [ ] yfinance 财报数据获取服务
+- [ ] SEC EDGAR 基础数据抓取（先做 earnings date + Form 4）
+- [ ] 宏观经济日历数据接入（Finnhub + 手动维护）
+- [ ] 事件聚合服务（多源 → 统一 events 表）
+- [ ] 定时任务框架搭建
+
+### Week 3：AI 解读 + API 完善
+
+- [ ] AI 解读模块（复用 LLM HTTP 接口）
+- [ ] 每日摘要 API
+- [ ] 事件查询 API（upcoming / today / yesterday / stock）
+- [ ] Redis 缓存集成
+- [ ] API 错误处理 + 日志
+
+### Week 4：前端 MVP
+
+- [ ] Next.js 项目初始化（App Router + Tailwind + shadcn/ui）
+- [ ] 持仓管理页面
+- [ ] 仪表盘（7 天时间线 + 今日摘要卡片）
+- [ ] 今日事件页（预览 + 复盘 tab）
+- [ ] 宏观日历页（基础月度视图）
+
+### Week 5：联调 + 推送 + 部署
+
+- [ ] 前后端联调
+- [ ] FCM Web Push 集成（注册 + 每日摘要推送）
+- [ ] Docker Compose 部署到 VPS
+- [ ] Nginx 配置
+- [ ] 手动测试 + 修 bug
+- [ ] 找 2–3 个朋友试用
+
+---
+
+## 9. 环境变量总览
 
 ```bash
-# 数据库
-DATABASE_URL=sqlite:///./stock_pulse.db
+# Database
+DATABASE_URL=postgresql+asyncpg://sp:password@localhost:5432/stock_pulse
+
+# Redis
+REDIS_URL=redis://localhost:6379/0
 
 # LLM
 STOCK_PULSE_LLM_ENDPOINT=http://127.0.0.1:9001/llm
 
-# 外部数据源
-FINNHUB_API_KEY=xxx          # 宏观日历（免费 tier）
+# Data sources
+FINNHUB_API_KEY=xxx
 
-# 应用
+# Firebase (Web Push)
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/firebase-service-account.json
+
+# App
 APP_ENV=production
 APP_PORT=9002
 ```
-
-### 6.3 定时任务
-
-使用 APScheduler（集成在 FastAPI 内）或系统 cron：
-
-| 任务 | 频率 | 说明 |
-|------|------|------|
-| 刷新财报日期 | 每天 2 次（UTC 06:00, 18:00） | 拉取所有持仓 ticker 的 earnings date |
-| 刷新宏观日历 | 每天 1 次（UTC 06:00） | 拉取当月 + 下月宏观事件 |
-| 生成 AI 摘要 | 每天 1 次（UTC 20:00，美东盘前） | 为今日事件批量生成 AI 解读 |
-| 清理过期数据 | 每周 1 次 | 清理 30 天前的已完成事件缓存 |
-
----
-
-## 7. MVP 开发计划（按周）
-
-### Week 1：后端骨架 + 数据层
-
-- [ ] 项目初始化（Python + FastAPI）
-- [ ] 数据库 schema 设计 + SQLite 接入
-- [ ] 持仓管理 API（CRUD）
-- [ ] yfinance 财报数据获取服务
-- [ ] 基础事件聚合逻辑
-
-### Week 2：宏观数据 + AI 解读
-
-- [ ] 宏观经济日历数据接入（Finnhub / 手动维护）
-- [ ] AI 解读模块（复用 LLM HTTP 接口）
-- [ ] 每日摘要 API
-- [ ] 定时数据刷新任务
-
-### Week 3：前端 MVP
-
-- [ ] Next.js 项目初始化
-- [ ] 持仓管理页面
-- [ ] 仪表盘（7 天时间线 + 今日摘要）
-- [ ] 每日事件页（今日预览 tab）
-
-### Week 4：联调 + 部署
-
-- [ ] 前后端联调
-- [ ] 基础错误处理 + loading 状态
-- [ ] VPS 部署（nginx + systemd）
-- [ ] 手动测试 + 修 bug
-- [ ] 找 2–3 个朋友试用，收集反馈
