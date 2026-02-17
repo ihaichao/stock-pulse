@@ -1,0 +1,23 @@
+# Backend dependencies
+fastapi
+uvicorn[standard]
+pydantic-settings
+
+# Database
+sqlalchemy[asyncio]>=2.0
+asyncpg
+alembic
+
+# Redis
+redis[hiredis]
+
+# Data sources
+yfinance
+requests
+httpx
+
+# Firebase (Web Push)
+firebase-admin
+
+# Scheduling
+apscheduler
