@@ -10,16 +10,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
 from .db.database import init_db
 from .api.portfolio import router as portfolio_router
+from .tasks.scheduler import setup_scheduler, scheduler
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup/shutdown lifecycle."""
-    # On startup: ensure tables exist (dev convenience; use Alembic in prod)
+    # On startup
     if settings.app_env == "development":
         await init_db()
+
+    setup_scheduler()
     yield
-    # Shutdown: nothing special for now
+
+    # Shutdown
+    scheduler.shutdown(wait=False)
 
 
 app = FastAPI(
