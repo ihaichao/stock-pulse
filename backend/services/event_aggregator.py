@@ -49,6 +49,10 @@ async def upsert_events(
         if event_date is None:
             continue
 
+        # Ensure timezone-aware
+        if isinstance(event_date, datetime) and event_date.tzinfo is None:
+            event_date = event_date.replace(tzinfo=timezone.utc)
+
         # Check for existing event
         conditions = [
             Event.event_type == event_type,
@@ -61,6 +65,8 @@ async def upsert_events(
 
         # Date match with some tolerance (same day)
         if isinstance(event_date, datetime):
+            if event_date.tzinfo is None:
+                event_date = event_date.replace(tzinfo=timezone.utc)
             day_start = event_date.replace(hour=0, minute=0, second=0, microsecond=0)
             day_end = day_start.replace(hour=23, minute=59, second=59)
             conditions.append(Event.event_date >= day_start)

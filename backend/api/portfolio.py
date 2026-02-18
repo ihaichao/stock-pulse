@@ -38,7 +38,7 @@ class PortfolioItemResponse(BaseModel):
 
 
 async def get_or_create_user(
-    db: AsyncSession,
+    db: AsyncSession = Depends(get_db),
     authorization: str = Header(...),
 ) -> User:
     """Extract user token from Authorization header; create user if new."""
