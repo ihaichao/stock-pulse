@@ -1,12 +1,12 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import Providers from "@/components/Providers";
-import Nav from "@/components/Nav";
+import Shell from "@/components/Shell";
 
 export const metadata: Metadata = {
-  title: "Stock Pulse — Event-Driven Stock Alerts",
+  title: "Stock Pulse — 事件驱动股票提醒",
   description:
-    "Never miss earnings, FOMC, CPI, or insider trades that affect your portfolio.",
+    "不再错过影响你持仓的财报、FOMC、CPI 或内部人交易。",
 };
 
 export default function RootLayout({
@@ -15,11 +15,10 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="zh">
-      <body className="bg-gray-50 text-gray-900 antialiased">
+    <html lang="zh" className="dark">
+      <body className="antialiased">
         <Providers>
-          <Nav />
-          <main className="mx-auto max-w-5xl px-4 py-6">{children}</main>
+          <Shell>{children}</Shell>
         </Providers>
       </body>
     </html>

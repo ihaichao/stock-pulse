@@ -38,8 +38,8 @@ def fetch_earnings_for_ticker(ticker: str) -> List[Dict[str, Any]]:
                 "ticker": ticker,
                 "event_type": "earnings",
                 "event_date": earnings_date,
-                "title": f"{ticker} Earnings Release",
-                "description": f"{company_name} is scheduled to report earnings.",
+                "title": f"{ticker} 财报发布",
+                "description": f"{company_name} 预计发布财报。",
                 "importance": "high",
                 "status": "upcoming",
                 "eps_estimate": float(eps_est) if eps_est else None,
@@ -65,7 +65,7 @@ def fetch_earnings_for_ticker(ticker: str) -> List[Dict[str, Any]]:
                         "ticker": ticker,
                         "event_type": "earnings",
                         "event_date": q_date,
-                        "title": f"{ticker} Earnings (Historical)",
+                        "title": f"{ticker} 历史财报",
                         "description": _build_historical_desc(ticker, row),
                         "importance": "medium",
                         "status": "completed",
@@ -95,6 +95,8 @@ def fetch_earnings_batch(tickers: List[str]) -> List[Dict[str, Any]]:
 
 def _extract_earnings_date(calendar: dict) -> Optional[datetime]:
     """Try to extract next earnings date from yfinance calendar."""
+    from datetime import date
+    
     # yfinance returns different formats depending on version
     for key in ("Earnings Date", "earningsDate"):
         val = calendar.get(key)
@@ -102,6 +104,11 @@ def _extract_earnings_date(calendar: dict) -> Optional[datetime]:
             continue
         if isinstance(val, list) and len(val) > 0:
             val = val[0]
+        
+        # Handle datetime.date (which is not datetime.datetime)
+        if isinstance(val, date) and not isinstance(val, datetime):
+            val = datetime.combine(val, datetime.min.time())
+
         if isinstance(val, datetime):
             return val.replace(tzinfo=timezone.utc) if val.tzinfo is None else val
         if hasattr(val, "to_pydatetime"):
@@ -136,8 +143,8 @@ def _safe_float(val: Any) -> Optional[float]:
 def _build_historical_desc(ticker: str, row) -> str:
     est = row.get("epsEstimate")
     actual = row.get("epsActual")
-    parts = [f"{ticker} reported earnings."]
+    parts = [f"{ticker} 已公布财报。"]
     if actual is not None and est is not None:
-        diff = "beat" if float(actual) >= float(est) else "missed"
-        parts.append(f"EPS: {actual} vs estimate {est} ({diff}).")
+        diff = "超预期" if float(actual) >= float(est) else "不及预期"
+        parts.append(f"EPS: {actual}，预期 {est}（{diff}）。")
     return " ".join(parts)

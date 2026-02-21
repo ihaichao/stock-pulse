@@ -35,28 +35,32 @@ class EventResponse(BaseModel):
     event_type: str
     event_date: str
     title: str
-    description: Optional[str]
+    description: Optional[str] = None
     importance: str
     status: str
-    eps_estimate: Optional[float]
-    eps_actual: Optional[float]
-    revenue_estimate: Optional[int]
-    revenue_actual: Optional[int]
-    report_time: Optional[str]
-    macro_event_name: Optional[str]
-    consensus: Optional[str]
-    actual_value: Optional[str]
-    previous_value: Optional[str]
-    filing_type: Optional[str]
-    filing_url: Optional[str]
-    ai_summary: Optional[str]
+    eps_estimate: Optional[float] = None
+    eps_actual: Optional[float] = None
+    revenue_estimate: Optional[int] = None
+    revenue_actual: Optional[int] = None
+    report_time: Optional[str] = None
+    macro_event_name: Optional[str] = None
+    consensus: Optional[str] = None
+    actual_value: Optional[str] = None
+    previous_value: Optional[str] = None
+    filing_type: Optional[str] = None
+    filing_url: Optional[str] = None
+    analyst_firm: Optional[str] = None
+    from_rating: Optional[str] = None
+    to_rating: Optional[str] = None
+    target_price: Optional[float] = None
+    ai_summary: Optional[str] = None
 
     class Config:
         from_attributes = True
 
 
 class EventDetailResponse(EventResponse):
-    ai_detail: Optional[str]
+    ai_detail: Optional[str] = None
 
 
 def _event_to_response(e: Event) -> dict:
@@ -80,6 +84,10 @@ def _event_to_response(e: Event) -> dict:
         "previous_value": e.previous_value,
         "filing_type": e.filing_type,
         "filing_url": e.filing_url,
+        "analyst_firm": getattr(e, "analyst_firm", None),
+        "from_rating": getattr(e, "from_rating", None),
+        "to_rating": getattr(e, "to_rating", None),
+        "target_price": float(e.target_price) if getattr(e, "target_price", None) is not None else None,
         "ai_summary": e.ai_summary,
     }
 
@@ -99,7 +107,7 @@ async def get_upcoming_events(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_or_create_user),
 ):
-    """Get events in the next 7 days related to user's portfolio + all macro events."""
+    """Get all upcoming events related to user's portfolio + all macro events."""
     cache_key = f"events:upcoming:{user.id}"
     cached = await redis_client.get(cache_key)
     if cached:
@@ -107,11 +115,9 @@ async def get_upcoming_events(
 
     tickers = await _get_user_tickers(db, user)
     now = datetime.now(timezone.utc)
-    week_later = now + timedelta(days=7)
 
     conditions = [
         Event.event_date >= now,
-        Event.event_date <= week_later,
     ]
 
     if tickers:

@@ -99,6 +99,10 @@ async def upsert_events(
                 previous_value=ed.get("previous_value"),
                 filing_type=ed.get("filing_type"),
                 filing_url=ed.get("filing_url"),
+                analyst_firm=ed.get("analyst_firm"),
+                from_rating=ed.get("from_rating"),
+                to_rating=ed.get("to_rating"),
+                target_price=ed.get("target_price"),
                 source=ed.get("source"),
                 raw_data=ed.get("raw_data"),
             )

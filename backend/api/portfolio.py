@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, BackgroundTasks
 from pydantic import BaseModel
 from sqlalchemy import select, delete
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -85,6 +85,7 @@ async def list_portfolio(
 @router.post("", response_model=PortfolioItemResponse, status_code=201)
 async def add_ticker(
     body: AddTickerRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_or_create_user),
 ):
@@ -106,6 +107,9 @@ async def add_ticker(
     db.add(item)
     await db.commit()
     await db.refresh(item)
+
+    # Trigger data fetch
+    background_tasks.add_task(fetch_initial_data, ticker)
 
     return PortfolioItemResponse(
         ticker=item.ticker,
@@ -130,3 +134,46 @@ async def remove_ticker(
     if result.rowcount == 0:
         raise HTTPException(status_code=404, detail=f"{ticker} not found in portfolio")
     await db.commit()
+
+
+async def fetch_initial_data(ticker: str) -> None:
+    """Background task to fetch initial data for a new ticker."""
+    from ..services.earnings import fetch_earnings_for_ticker
+    from ..services.edgar import fetch_insider_transactions
+    from ..services.event_aggregator import upsert_events
+    from ..db.database import async_session
+    import logging
+
+    logger = logging.getLogger(__name__)
+    logger.info(f"Starting initial data fetch for {ticker}")
+
+    async with async_session() as db:
+        # 1. Earnings (sync, blocks loop briefly but acceptable for single ticker)
+        try:
+            earnings_events = fetch_earnings_for_ticker(ticker)
+            if earnings_events:
+                await upsert_events(db, earnings_events)
+                logger.info(f"Fetched {len(earnings_events)} earnings events for {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to fetch initial earnings for {ticker}: {e}")
+
+        # 2. Insider transactions (async)
+        try:
+            insider_events = await fetch_insider_transactions(ticker)
+            if insider_events:
+                await upsert_events(db, insider_events)
+                logger.info(f"Fetched {len(insider_events)} insider events for {ticker}")
+        except Exception as e:
+            logger.error(f"Failed to fetch initial insider events for {ticker}: {e}")
+
+    # 3. Invalidate Redis cache so dashboard shows fresh data
+    try:
+        from ..db.redis import redis_client
+        keys_to_delete = await redis_client.keys("events:upcoming:*")
+        keys_to_delete += await redis_client.keys("events:today")
+        keys_to_delete.append(f"stock:events:{ticker}")
+        if keys_to_delete:
+            await redis_client.delete(*keys_to_delete)
+            logger.info(f"Invalidated {len(keys_to_delete)} cache keys after fetching {ticker}")
+    except Exception as e:
+        logger.error(f"Failed to invalidate cache for {ticker}: {e}")

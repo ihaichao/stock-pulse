@@ -62,6 +62,10 @@ export interface StockEvent {
   previous_value: string | null;
   filing_type: string | null;
   filing_url: string | null;
+  analyst_firm: string | null;
+  from_rating: string | null;
+  to_rating: string | null;
+  target_price: number | null;
   ai_summary: string | null;
   ai_detail?: string | null;
 }
@@ -73,6 +77,50 @@ export interface DailySummary {
   events: StockEvent[];
   macro_events: StockEvent[];
   portfolio_events: StockEvent[];
+}
+
+export interface StockProfile {
+  ticker: string;
+  company_name: string;
+  long_name: string | null;
+  sector: string | null;
+  industry: string | null;
+  country: string | null;
+  website: string | null;
+  description: string | null;
+  current_price: number | null;
+  previous_close: number | null;
+  market_cap: number | null;
+  currency: string;
+  price_change: number | null;
+  price_change_percent: number | null;
+  pe_ratio: number | null;
+  forward_pe: number | null;
+  eps_ttm: number | null;
+  dividend_yield: number | null;
+  beta: number | null;
+  fifty_two_week_high: number | null;
+  fifty_two_week_low: number | null;
+  avg_volume: number | null;
+  earnings_date: string | null;
+}
+
+export interface EarningsHistoryItem {
+  event_date: string;
+  eps_estimate: number | null;
+  eps_actual: number | null;
+  revenue_estimate: number | null;
+  revenue_actual: number | null;
+  beat: boolean | null;
+  surprise_percent: number | null;
+  status: string;
+}
+
+export interface EarningsHistory {
+  ticker: string;
+  history: EarningsHistoryItem[];
+  beat_rate: number | null;
+  total_quarters: number;
 }
 
 // --- API calls ---
@@ -101,4 +149,11 @@ export const api = {
   // Macro
   getMacroCalendar: (month?: string) =>
     apiFetch<StockEvent[]>(`/macro/calendar${month ? `?month=${month}` : ""}`),
+
+  // Stock profile
+  getStockProfile: (ticker: string) =>
+    apiFetch<StockProfile>(`/stock/${ticker}/profile`),
+  getEarningsHistory: (ticker: string) =>
+    apiFetch<EarningsHistory>(`/stock/${ticker}/earnings-history`),
 };
+

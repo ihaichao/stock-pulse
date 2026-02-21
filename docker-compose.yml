@@ -27,5 +27,35 @@ services:
       timeout: 5s
       retries: 5
 
+  backend:
+    build: ./backend
+    volumes:
+      - ./backend:/app/backend
+    environment:
+      DATABASE_URL: postgresql+asyncpg://sp:${DB_PASSWORD:-stockpulse123}@postgres:5432/stock_pulse
+      REDIS_URL: redis://redis:6379/0
+      APP_ENV: development
+      FINNHUB_API_KEY: ${FINNHUB_API_KEY:-d6aj6i9r01qqjvbqlg30d6aj6i9r01qqjvbqlg3g}
+    ports:
+      - "9002:9002"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build: ./frontend
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:9002
+      INTERNAL_API_URL: http://backend:9002
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
 volumes:
   pgdata:

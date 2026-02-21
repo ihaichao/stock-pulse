@@ -49,6 +49,33 @@ def setup_scheduler() -> None:
         replace_existing=True,
     )
 
+    # Fetch analyst ratings: UTC 08:00 and 20:00
+    scheduler.add_job(
+        run_fetch_analyst,
+        CronTrigger(hour="8,20", minute=0),
+        id="fetch_analyst",
+        name="Fetch analyst ratings",
+        replace_existing=True,
+    )
+
+    # Fetch congressional trades: UTC 09:00 and 21:00
+    scheduler.add_job(
+        run_fetch_congress,
+        CronTrigger(hour="9,21", minute=0),
+        id="fetch_congress",
+        name="Fetch congressional trades",
+        replace_existing=True,
+    )
+
+    # Fetch unusual options: UTC 21:30 (after market close)
+    scheduler.add_job(
+        run_fetch_unusual_options,
+        CronTrigger(hour=21, minute=30),
+        id="fetch_unusual_options",
+        name="Fetch unusual options activity",
+        replace_existing=True,
+    )
+
     # Generate AI summaries: UTC 12:00 (before US market open)
     scheduler.add_job(
         run_generate_summaries,
@@ -107,6 +134,59 @@ async def run_fetch_macro() -> None:
         events = await fetch_macro_events()
         count = await upsert_events(db, events)
         logger.info(f"Macro fetch done: {count} new events")
+
+
+async def run_fetch_analyst() -> None:
+    """Fetch analyst ratings for all tracked tickers."""
+    import asyncio
+    from ..db.database import async_session
+    from ..services.analyst import fetch_analyst_ratings_batch
+    from ..services.event_aggregator import get_all_tracked_tickers, upsert_events
+
+    logger.info("Starting analyst ratings fetch job")
+    async with async_session() as db:
+        tickers = await get_all_tracked_tickers(db)
+        if not tickers:
+            logger.info("No tracked tickers, skipping analyst ratings fetch")
+            return
+        # yfinance is sync, run in thread pool
+        events = await asyncio.get_event_loop().run_in_executor(
+            None, fetch_analyst_ratings_batch, tickers
+        )
+        count = await upsert_events(db, events)
+        logger.info(f"Analyst ratings fetch done: {count} new events from {len(tickers)} tickers")
+
+
+async def run_fetch_congress() -> None:
+    """Fetch congressional trades."""
+    from ..db.database import async_session
+    from ..services.congress_trades import fetch_congress_trades
+    from ..services.event_aggregator import get_all_tracked_tickers, upsert_events
+
+    logger.info("Starting congressional trades fetch job")
+    async with async_session() as db:
+        tickers = await get_all_tracked_tickers(db)
+        events = await fetch_congress_trades(tickers=tickers if tickers else None)
+        count = await upsert_events(db, events)
+        logger.info(f"Congressional trades fetch done: {count} new events")
+
+
+async def run_fetch_unusual_options() -> None:
+    """Fetch unusual options activity."""
+    from ..db.database import async_session
+    from ..config import settings
+    from ..services.unusual_options import fetch_unusual_options_batch
+    from ..services.event_aggregator import get_all_tracked_tickers, upsert_events
+
+    logger.info("Starting unusual options fetch job")
+    async with async_session() as db:
+        tickers = await get_all_tracked_tickers(db)
+        if not tickers:
+            logger.info("No tracked tickers, skipping unusual options fetch")
+            return
+        events = await fetch_unusual_options_batch(tickers, settings.finnhub_api_key)
+        count = await upsert_events(db, events)
+        logger.info(f"Unusual options fetch done: {count} new events")
 
 
 async def run_generate_summaries() -> None:

@@ -49,6 +49,12 @@ class Event(Base):
     filing_type: Mapped[str | None] = mapped_column(String(16), nullable=True)
     filing_url: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Analyst rating fields
+    analyst_firm: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    from_rating: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    to_rating: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    target_price: Mapped[float | None] = mapped_column(Numeric(10, 2), nullable=True)
+
     # AI
     ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     ai_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
